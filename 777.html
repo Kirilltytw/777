@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Совместный просмотр видео</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: #f5f5f5;
+            line-height: 1.6;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        #connection-status {
+            padding: 10px;
+            border-radius: 4px;
+            margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .status-connected {
+            background: #e8f5e9;
+            color: #2ecc71;
+        }
+        .status-disconnected {
+            background: #ffebee;
+            color: #e74c3c;
+        }
+        .status-connecting {
+            background: #fff3cd;
+            color: #856404;
+            animation: pulse 1.5s infinite;
+        }
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+        #video-frame {
+            width: 100%;
+            height: 450px;
+            background: #000;
+            margin-bottom: 15px;
+            border: none;
+            border-radius: 4px;
+        }
+        .controls {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+            flex-wrap: wrap;
+        }
+        button, input {
+            padding: 10px 15px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 16px;
+        }
+        button {
+            background: #3498db;
+            color: white;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        button:hover {
+            background: #2980b9;
+        }
+        button:disabled {
+            background: #95a5a6;
+            cursor: not-allowed;
+        }
+        button.active {
+            background: #27ae60;
+            box-shadow: 0 0 10px rgba(39, 174, 96, 0.5);
+        }
+        #chat-messages {
+            height: 200px;
+            overflow-y: auto;
+            border: 1px solid #ddd;
+            padding: 10px;
+            margin-bottom: 10px;
+            border-radius: 4px;
+            background: #fafafa;
+        }
+        .chat-message {
+            margin-bottom: 8px;
+            padding: 6px 10px;
+            border-radius: 4px;
+            background: #eef;
+        }
+        .my-message {
+            background: #d4edda;
+            text-align: right;
+        }
+        .chat-controls {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        .invite-section {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 4px;
+        }
+        #room-url {
+            width: 100%;
+            padding: 8px;
+            margin: 5px 0;
+            border: 1px solid #ddd;
+            background: white;
+        }
+        @media (max-width: 600px) {
+            .controls {
+                flex-direction: column;
+            }
+            button, input {
+                width: 100%;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Совместный просмотр</h1>
+        
+        <div id="connection-status" class="status-disconnected">
+            <span id="status-icon">🔴</span>
+            <span id="status-text">Подключение...</span>
+        </div>
+        
+        <iframe id="video-frame" allowfullscreen></iframe>
+        
+        <div class="controls">
+            <input type="text" id="video-url" placeholder="Ссылка на видео (VK/Rutube)">
+            <button id="load-btn">Загрузить</button>
+            <button id="play-btn" disabled>▶️ Воспроизвести</button>
+            <button id="pause-btn" disabled>⏸️ Пауза</button>
+            <button id="sync-btn" disabled>🔁 Синхронизировать</button>
+        </div>
+        
+        <div id="video-status">Видео не загружено</div>
+        
+        <div id="chat-messages"></div>
+        <div class="chat-controls">
+            <input type="text" id="chat-input" placeholder="Ваше сообщение" disabled>
+            <button id="send-btn" disabled>Отправить</button>
+        </div>
+        
+        <div class="invite-section">
+            <p>Пригласите друзей:</p>
+            <input type="text" id="room-url" readonly>
+            <button id="copy-btn">Копировать</button>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <script>
+        // Конфигурация
+        const CONFIG = {
+            servers: [
+                {
+                    host: '0.peerjs.com',
+                    port: 443,
+                    secure: true,
+                    label: 'Основной сервер'
+                },
+                {
+                    host: 'peerjs-server.herokuapp.com',
+                    port: 443,
+                    secure: true,
+                    label: 'Резервный сервер'
+                }
+            ],
+            currentServerIndex: 0,
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' }
+            ],
+            syncInterval: 3000
+        };
+
+        // Состояние приложения
+        const state = {
+            peer: null,
+            conn: null,
+            roomId: window.location.hash.substring(1) || generateRoomId(),
+            isHost: !window.location.hash,
+            currentVideo: null,
+            videoState: {
+                isPlaying: false,
+                currentTime: 0,
+                lastUpdate: 0
+            },
+            syncTimer: null,
+            reconnectAttempts: 0,
+            maxReconnectAttempts: 5
+        };
+
+        // Элементы DOM
+        const DOM = {
+            connectionStatus: null,
+            statusIcon: null,
+            statusText: null,
+            videoFrame: null,
+            videoUrl: null,
+            loadBtn: null,
+            playBtn: null,
+            pauseBtn: null,
+            syncBtn: null,
+            videoStatus: null,
+            chatMessages: null,
+            chatInput: null,
+            sendBtn: null,
+            roomUrl: null,
+            copyBtn: null
+        };
+
+        // Инициализация приложения
+        document.addEventListener('DOMContentLoaded', () => {
+            initDOM();
+            setupEventListeners();
+            initPeerConnection();
+            
+            // Обработчик сообщений от iframe
+            window.addEventListener('message', function(event) {
+                try {
+                    if (typeof event.data === 'object' && event.data.currentTime !== undefined) {
+                        state.videoState.currentTime = event.data.currentTime;
+                        state.videoState.lastUpdate = Date.now();
+                    }
+                } catch (e) {
+                    console.log('Message error:', e);
+                }
+            });
+        });
+
+        function initDOM() {
+            DOM.connectionStatus = document.getElementById('connection-status');
+            DOM.statusIcon = document.getElementById('status-icon');
+            DOM.statusText = document.getElementById('status-text');
+            DOM.videoFrame = document.getElementById('video-frame');
+            DOM.videoUrl = document.getElementById('video-url');
+            DOM.loadBtn = document.getElementById('load-btn');
+            DOM.playBtn = document.getElementById('play-btn');
+            DOM.pauseBtn = document.getElementById('pause-btn');
+            DOM.syncBtn = document.getElementById('sync-btn');
+            DOM.videoStatus = document.getElementById('video-status');
+            DOM.chatMessages = document.getElementById('chat-messages');
+            DOM.chatInput = document.getElementById('chat-input');
+            DOM.sendBtn = document.getElementById('send-btn');
+            DOM.roomUrl = document.getElementById('room-url');
+            DOM.copyBtn = document.getElementById('copy-btn');
+            
+            if (state.isHost) {
+                DOM.roomUrl.value = window.location.href;
+            }
+        }
+
+        function setupEventListeners() {
+            DOM.copyBtn.addEventListener('click', copyRoomLink);
+            DOM.loadBtn.addEventListener('click', handleLoadVideo);
+            DOM.playBtn.addEventListener('click', handlePlay);
+            DOM.pauseBtn.addEventListener('click', handlePause);
+            DOM.syncBtn.addEventListener('click', handleSync);
+            DOM.sendBtn.addEventListener('click', sendMessage);
+            DOM.chatInput.addEventListener('keypress', (e) => e.key === 'Enter' && sendMessage());
+        }
+
+        // Работа с PeerJS
+        function initPeerConnection() {
+            if (CONFIG.currentServerIndex >= CONFIG.servers.length) {
+                updateStatus('Все серверы недоступны', 'disconnected');
+                return;
+            }
+
+            const server = CONFIG.servers[CONFIG.currentServerIndex];
+            updateStatus(`Подключение к ${server.label}...`, 'connecting');
+            
+            state.peer = new Peer({
+                host: server.host,
+                port: server.port,
+                secure: server.secure,
+                config: { iceServers: CONFIG.iceServers },
+                debug: 3
+            });
+
+            state.peer.on('open', (id) => {
+                state.reconnectAttempts = 0;
+                updateStatus(`Подключено к ${server.label}`, 'connected');
+                
+                if (state.isHost) {
+                    window.location.hash = id;
+                    state.roomId = id;
+                    updateRoomLink();
+                    
+                    state.peer.on('connection', (conn) => {
+                        setupConnection(conn);
+                    });
+                } else {
+                    setupConnection(state.peer.connect(state.roomId));
+                }
+            });
+
+            state.peer.on('error', handlePeerError);
+            state.peer.on('disconnected', tryReconnect);
+        }
+
+        function setupConnection(conn) {
+            state.conn = conn;
+            
+            conn.on('open', () => {
+                updateStatus('Успешное подключение!', 'connected');
+                enableControls();
+                startSyncTimer();
+                
+                if (!state.isHost) {
+                    conn.send({ type: 'request_state' });
+                }
+            });
+
+            conn.on('data', handleData);
+            conn.on('close', handleDisconnect);
+            conn.on('error', handleConnectionError);
+        }
+
+        // Обработка сообщений
+        function handleData(data) {
+            switch(data.type) {
+                case 'video':
+                    loadVideo(data.url);
+                    break;
+                case 'play':
+                    setVideoState(true, data.currentTime, data.timestamp);
+                    break;
+                case 'pause':
+                    setVideoState(false, data.currentTime, data.timestamp);
+                    break;
+                case 'sync':
+                    syncVideo(data.currentTime, data.isPlaying);
+                    break;
+                case 'chat':
+                    addMessage(data.sender, data.text, false);
+                    break;
+                case 'request_state':
+                    if (state.isHost) {
+                        sendVideoState();
+                    }
+                    break;
+            }
+        }
+
+        // Управление видео
+        function loadVideo(url) {
+            if (!url) return;
+            
+            let embedUrl = '';
+            if (url.includes('vk.com')) {
+                const videoId = url.match(/video(-?\d+_\d+)/)[1];
+                embedUrl = `https://vk.com/video_ext.php?oid=${videoId.split('_')[0]}&id=${videoId.split('_')[1]}`;
+            } else if (url.includes('rutube.ru')) {
+                const videoId = url.match(/rutube\.ru\/video\/([a-zA-Z0-9]+)/)[1];
+                embedUrl = `https://rutube.ru/play/embed/${videoId}`;
+            }
+            
+            if (embedUrl) {
+                DOM.videoFrame.src = embedUrl;
+                state.currentVideo = url;
+                DOM.videoStatus.textContent = `Видео загружено: ${url.substring(0, 50)}...`;
+                
+                if (state.conn) {
+                    state.conn.send({ 
+                        type: 'video', 
+                        url: url 
+                    });
+                }
+            }
+        }
+
+        function setVideoState(isPlaying, currentTime, timestamp) {
+            state.videoState = {
+                isPlaying,
+                currentTime,
+                lastUpdate: timestamp || Date.now()
+            };
+            
+            if (isPlaying) {
+                DOM.playBtn.classList.add('active');
+                DOM.pauseBtn.classList.remove('active');
+                DOM.videoFrame.contentWindow.postMessage(JSON.stringify({
+                    method: 'play',
+                    value: currentTime
+                }), '*');
+            } else {
+                DOM.pauseBtn.classList.add('active');
+                DOM.playBtn.classList.remove('active');
+                DOM.videoFrame.contentWindow.postMessage(JSON.stringify({
+                    method: 'pause',
+                    value: currentTime
+                }), '*');
+            }
+        }
+
+        function syncVideo(currentTime, isPlaying) {
+            DOM.videoFrame.contentWindow.postMessage(JSON.stringify({
+                method: 'seekTo',
+                value: currentTime
+            }), '*');
+            
+            setVideoState(isPlaying, currentTime);
+        }
+
+        // Обработчики кнопок
+        function handleLoadVideo() {
+            const url = DOM.videoUrl.value.trim();
+            if (url) {
+                loadVideo(url);
+            }
+        }
+
+        function handlePlay() {
+            if (!state.conn || !state.currentVideo) return;
+            
+            const currentTime = calculateCurrentTime();
+            setVideoState(true, currentTime);
+            
+            state.conn.send({
+                type: 'play',
+                currentTime: currentTime,
+                timestamp: Date.now()
+            });
+        }
+
+        function handlePause() {
+            if (!state.conn || !state.currentVideo) return;
+            
+            const currentTime = calculateCurrentTime();
+            setVideoState(false, currentTime);
+            
+            state.conn.send({
+                type: 'pause',
+                currentTime: currentTime,
+                timestamp: Date.now()
+            });
+        }
+
+        function handleSync() {
+            if (!state.conn || !state.currentVideo) return;
+            
+            const currentTime = calculateCurrentTime();
+            syncVideo(currentTime, state.videoState.isPlaying);
+            
+            state.conn.send({
+                type: 'sync',
+                currentTime: currentTime,
+                isPlaying: state.videoState.isPlaying,
+                timestamp: Date.now()
+            });
+        }
+
+        // Синхронизация
+        function startSyncTimer() {
+            stopSyncTimer();
+            state.syncTimer = setInterval(() => {
+                if (state.isHost && state.conn && state.videoState.isPlaying) {
+                    const currentTime = calculateCurrentTime();
+                    state.conn.send({
+                        type: 'sync',
+                        currentTime: currentTime,
+                        isPlaying: true,
+                        timestamp: Date.now()
+                    });
+                }
+            }, CONFIG.syncInterval);
+        }
+
+        function stopSyncTimer() {
+            if (state.syncTimer) {
+                clearInterval(state.syncTimer);
+                state.syncTimer = null;
+            }
+        }
+
+        function calculateCurrentTime() {
+            if (state.videoState.isPlaying) {
+                return state.videoState.currentTime + (Date.now() - state.videoState.lastUpdate) / 1000;
+            }
+            return state.videoState.currentTime;
+        }
+
+        function sendVideoState() {
+            if (!state.conn || !state.isHost) return;
+            
+            state.conn.send({
+                type: 'sync',
+                currentTime: calculateCurrentTime(),
+                isPlaying: state.videoState.isPlaying,
+                timestamp: Date.now()
+            });
+        }
+
+        // Чат
+        function sendMessage() {
+            const text = DOM.chatInput.value.trim();
+            if (text && state.conn) {
+                addMessage('Вы', text, true);
+                state.conn.send({
+                    type: 'chat',
+                    sender: state.isHost ? 'Хост' : 'Участник',
+                    text: text
+                });
+                DOM.chatInput.value = '';
+            }
+        }
+
+        function addMessage(sender, text, isMyMessage) {
+            const message = document.createElement('div');
+            message.className = `chat-message ${isMyMessage ? 'my-message' : ''}`;
+            message.innerHTML = `<strong>${sender}:</strong> ${text}`;
+            DOM.chatMessages.appendChild(message);
+            DOM.chatMessages.scrollTop = DOM.chatMessages.scrollHeight;
+        }
+
+        // Вспомогательные функции
+        function updateStatus(message, status) {
+            if (!DOM.connectionStatus || !DOM.statusText) return;
+            
+            DOM.connectionStatus.className = `status-${status}`;
+            DOM.statusText.textContent = message;
+            DOM.statusIcon.textContent = 
+                status === 'connected' ? '🟢' : 
+                status === 'connecting' ? '🟡' : '🔴';
+        }
+
+        function enableControls() {
+            [DOM.playBtn, DOM.pauseBtn, DOM.syncBtn, DOM.chatInput, DOM.sendBtn].forEach(el => {
+                if (el) el.disabled = false;
+            });
+        }
+
+        function generateRoomId() {
+            return Math.random().toString(36).substring(2, 8);
+        }
+
+        function updateRoomLink() {
+            if (DOM.roomUrl) {
+                DOM.roomUrl.value = window.location.href;
+            }
+        }
+
+        function copyRoomLink() {
+            if (DOM.roomUrl) {
+                DOM.roomUrl.select();
+                document.execCommand('copy');
+                alert('Ссылка скопирована в буфер обмена!');
+            }
+        }
+
+        function handleDisconnect() {
+            updateStatus('Соединение разорвано', 'disconnected');
+            stopSyncTimer();
+            tryReconnect();
+        }
+
+        function tryReconnect() {
+            if (state.reconnectAttempts >= state.maxReconnectAttempts) {
+                updateStatus('Не удалось подключиться', 'disconnected');
+                return;
+            }
+            
+            state.reconnectAttempts++;
+            setTimeout(() => {
+                CONFIG.currentServerIndex = (CONFIG.currentServerIndex + 1) % CONFIG.servers.length;
+                initPeerConnection();
+            }, Math.min(1000 * state.reconnectAttempts, 5000));
+        }
+
+        function handlePeerError(err) {
+            console.error('PeerJS error:', err);
+            let errorMessage = 'Ошибка подключения';
+            if (err.type === 'peer-unavailable') errorMessage = 'Сервер перегружен';
+            if (err.type === 'socket-error') errorMessage = 'Проблемы с соединением';
+            
+            updateStatus(errorMessage, 'disconnected');
+            tryReconnect();
+        }
+
+        function handleConnectionError(err) {
+            console.error('Connection error:', err);
+            updateStatus('Ошибка соединения', 'disconnected');
+            tryReconnect();
+        }
+    </script>
+</body>
+</html>
